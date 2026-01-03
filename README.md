@@ -1,6 +1,6 @@
 # DNA Typewriter MOI Inference
 
-This repository deals with analysis of DNA Typewriter sequencing data, as shown in Regalado & Qiu et al, 2025 (https://www.biorxiv.org/content/10.1101/2025.05.23.655664v3).
+This repository deals with analysis of DNA Typewriter sequencing data, as shown in Regalado & Qiu et al, 2025 (https://www.biorxiv.org/content/10.1101/2025.05.23.655664v3). For detailed explanation, see the Supplementary Note.
 
 A major challenge in analyzing DNA Typewriter Tape (DTT) data is that Tape barcodes (TapeBCs) do not uniquely define genomic loci, as most DTTs are duplicated—likely due to the high MOI piggyBac transposase system. This duplication complicates lineage reconstruction, making it difficult to compare edit patterns across cells without knowing the originating DTT locus. To address this, we developed a method to infer the most likely number of integration events per TapeBC into the genome as well as the edit patterns that were generated from each integration locus, capturing the true sequence of events that occur from the starting cell at each locus independently. The key principle on which this method was based was the idea that in a given cell, for a given TapeBC, there should exist only one observed pattern of sequential edits. If multiple patterns of edits with the same TapeBC in the same cell are observed, this is evidence for multiple genomic integration sites for that TapeBC and associated DTT. 
 
