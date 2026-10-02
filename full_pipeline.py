@@ -6,23 +6,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import Counter, defaultdict
 from itertools import combinations, groupby
-from sklearn.metrics import pairwise_distances
-from sklearn.cluster import DBSCAN
 import seaborn as sns
-from sklearn.neighbors import KernelDensity, BallTree
+from sklearn.neighbors import BallTree
 from scipy.signal import find_peaks
+from scipy.ndimage import gaussian_filter1d
+from scale_space_threshold import scale_space_meaningful_valleys
 import igraph as ig
 import os
 import contextlib
 import traceback
-from sklearn.neighbors import KNeighborsClassifier
 import sys
 import argparse
 import timeit
 from datetime import timedelta
-from sklearn.manifold import TSNE
 from joblib import Parallel, delayed
-from multiprocessing import cpu_count
 
 import matplotlib as mpl
 mpl.rcParams['figure.dpi'] = 500
@@ -32,8 +29,31 @@ import random
 import functools
 print = functools.partial(print, flush=True)
 
-np.random.seed(42)
-random.seed(42)
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility: a single seed governs all randomness in the pipeline.
+# set_seeds() is called at module import and again at the start of main(),
+# so reproducibility is robust to import timing and to joblib workers (each
+# worker re-imports the module). The graph-coloring random search derives its
+# per-batch RNG from this seed (see run_coloring / _coloring_batch).
+# ---------------------------------------------------------------------------
+RANDOM_SEED = 42
+
+
+def set_seeds(seed=RANDOM_SEED):
+    """Seed every RNG the pipeline uses (numpy + Python random)."""
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+set_seeds()
 
 sns.set_style("white")
 
@@ -91,28 +111,65 @@ def shared_prefix_words(a, b):
     return count
 
 
-def compute_kde_threshold(log_umi, bw=0.15, rel_height=0.25, log=True):
-    data = np.ndarray.flatten(log_umi.values)
-    kde = KernelDensity(bandwidth=bw)
-    kde.fit(data.reshape(-1, 1))
-    x_bin = np.histogram(data, bins=10)[1]
-    kde_x = np.linspace(min(x_bin) - 0.50, max(x_bin) + 0.50, 500)
-    if log:
-        kde_density = kde.score_samples(kde_x.reshape(-1, 1))
-    else:
-        kde_density = np.exp(kde.score_samples(kde_x.reshape(-1, 1)))
-    peaks, properties = find_peaks(kde_density, width=(None, None), rel_height=rel_height)
-    # Use the first two peaks (sorted by position) to find the valley between
-    # absence (zero mode) and presence (first signal mode).
-    # This correctly separates noise from signal regardless of expression level.
-    modes = np.sort(peaks[:2]) if len(peaks) >= 2 else peaks
-    try:
-        new_range = kde_density[modes[0]:modes[1]]
-        new_min = np.argmin(new_range) + modes[0]
-        new_min = kde_x[new_min]
-    except:
-        new_min = 0.0
-    return new_min, kde_x, kde_density
+def compute_kde_threshold(log_umi, bw=0.15, rel_height=0.25, log=True,
+                           n_min_for_hist=100_000, min_lifetime_frac=0.5):
+    """Find the binarization threshold between zero and signal modes.
+
+    Runs the scale-space meaningful-valleys detector (Gilles & Heal 2014,
+    adapted) on the FULL flattened distribution of `log_umi` (including the
+    zero spike). Returns the LEFTMOST meaningful valley. In zero-inflated
+    DTT data the leftmost valley is between the zero spike and the start of
+    nonzero data, which acts as an "anything above zero counts as signal"
+    threshold. If a real noise mode exists, it presents as a noise smear in
+    the leftmost bins and the valley shifts accordingly.
+
+    When no meaningful valley exists (unimodal data), returns 0.0.
+
+    Parameters `bw`, `rel_height`, `log`, and `n_min_for_hist` are kept for
+    API compatibility but are not used. `min_lifetime_frac` controls the
+    meaningfulness floor.
+
+    Returns
+    -------
+    threshold : float
+    x_grid : np.ndarray
+        Bin centers of the histogram, for plot compatibility.
+    density : np.ndarray
+        Lightly-smoothed log-density at x_grid.
+    """
+    data = np.asarray(log_umi.values).flatten() if hasattr(log_umi, "values") \
+           else np.asarray(log_umi).flatten()
+    data = data[np.isfinite(data)]
+    n = len(data)
+    if n < 2:
+        return 0.0, np.array([0.0, 1.0]), np.array([0.0, 0.0])
+
+    # Data-size-adaptive fixed bin count. Real DTT data is heavily
+    # zero-inflated (often >99% zeros after row normalization), so we cannot
+    # rely on Freedman-Diaconis (IQR collapses to 0). The scale-space
+    # smoothing ladder handles bandwidth adaptation internally.
+    n_bins_use = int(min(200, max(10, np.sqrt(n))))
+    valleys, diag = scale_space_meaningful_valleys(
+        data, n_bins=n_bins_use, log_density=log,
+        min_lifetime_frac=min_lifetime_frac,
+        return_diagnostics=True,
+    )
+    threshold = float(valleys[0]) if valleys else 0.0
+
+    counts = diag.get('counts')
+    centers = diag.get('centers')
+    if counts is None or centers is None or len(counts) == 0:
+        try:
+            counts, edges = np.histogram(data, bins='fd')
+        except Exception:
+            counts, edges = np.histogram(data, bins=50)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+    n_bins = len(counts)
+    sigma_plot = max(1.0, n_bins / 75.0)
+    smoothed = gaussian_filter1d(counts.astype(float), sigma=sigma_plot, mode='reflect')
+    density = np.log(smoothed + 1.0) if log else smoothed
+    return threshold, centers, density
+
 
 
 def build_pattern_trie(patterns):
@@ -177,10 +234,33 @@ def redistribute_shadow_umis(nUMI, log_umi, threshold):
     return nUMI
 
 
+def _aggregate_cell_pattern(df):
+    """Collapse to one row per (Cell, Pattern), summing nUMI.
+
+    parse_sites is many-to-one (many raw site-tuples map to the same parsed
+    pattern), so the input routinely has multiple rows per (Cell, Pattern).
+    Aggregating here ensures the noise-redistribution proportions are computed
+    from the correct per-(cell,pattern) total UMI rather than an arbitrary
+    single row's value. Non-aggregated columns (TargetBC, etc.) take the first
+    value, which is safe because this function is always called on a single
+    TapeBC's slice.
+    """
+    if len(df) == 0:
+        return df
+    agg = {c: 'first' for c in df.columns if c not in ('Cell', 'Pattern', 'nUMI')}
+    agg['nUMI'] = 'sum'
+    out = df.groupby(['Cell', 'Pattern'], as_index=False).agg(agg)
+    return out[df.columns]
+
+
 def redistribute_noise_to_real(test_real, test_noise):
     if len(test_noise) == 0 or len(test_real) == 0:
         print("  No noise redistribution needed")
         return test_real
+    # Collapse duplicate (Cell, Pattern) rows so UMI sums and proportional
+    # redistribution are computed correctly (see _aggregate_cell_pattern).
+    test_real = _aggregate_cell_pattern(test_real)
+    test_noise = _aggregate_cell_pattern(test_noise)
     real_patterns = [p for p in test_real['Pattern'].unique() if p != "ETY"]
     noise_patterns = [p for p in test_noise['Pattern'].unique() if p != "ETY"]
     if len(real_patterns) == 0 or len(noise_patterns) == 0:
@@ -303,19 +383,25 @@ def build_cooccurrence_graph_from_clusters(patterns, cluster_sig, binary_columns
 # Graph coloring
 # =========================================================================
 
-def greedy_color_random(adj, n, rng):
+def greedy_color_random(adj, n, rng, max_colors=None):
     """Greedy graph coloring with random vertex ordering.
-    
+
     Equivalent to nx.greedy_color(G, strategy='random_sequential') but operates
     on a pre-extracted adjacency list (list of lists of neighbor indices) for
     maximum performance in tight loops.
-    
+
     Args:
         adj: list of lists — adj[v] = list of neighbor vertex indices
         n: number of vertices
         rng: random.Random instance for shuffling
-    
-    Returns a list of color assignments indexed by vertex ID.
+        max_colors: if provided, abort and return None as soon as this many
+            colors are needed (i.e., when we would assign color index
+            >= max_colors). This is the early-abort optimization: most random
+            orderings on large graphs cannot beat the current best K, so
+            we skip them after a few vertices instead of running to completion.
+
+    Returns a list of color assignments indexed by vertex ID, or None if
+    aborted because the ordering needed >= max_colors colors.
     """
     order = list(range(n))
     rng.shuffle(order)
@@ -330,6 +416,11 @@ def greedy_color_random(adj, n, rng):
         c = 0
         while used[c]:
             c += 1
+        # Early abort: assigning color index c means using (c+1) distinct
+        # colors. If c >= max_colors, this ordering cannot match or improve
+        # the current best, so bail out. (used is local; no cleanup needed.)
+        if max_colors is not None and c >= max_colors:
+            return None
         colors[v] = c
         for nb in nbs:
             c = colors[nb]
@@ -339,15 +430,31 @@ def greedy_color_random(adj, n, rng):
 
 
 def _coloring_batch(adj, n_vertices, names, pattern_to_idx, p1_idx, p2_idx, w_arr,
-                    n_patterns, batch_size, current_best_clique, current_best_sum):
+                    n_patterns, batch_size, current_best_clique, current_best_sum,
+                    rng_seed=None):
+    """Run a batch of random-ordering greedy colorings and keep the best.
+
+    Uses early-abort via `max_colors=current_best_clique`: any ordering that
+    would require >= current_best_clique colors is dropped after the first
+    vertex that needs that color, since it cannot improve on the best so far.
+
+    `rng_seed` makes the random vertex orderings reproducible: with a fixed
+    seed the same input graph produces the same coloring search every run.
+    When None, a system-entropy-seeded RNG is used (non-reproducible).
+    """
     import random as _rng_mod
-    rng = _rng_mod.Random()
+    rng = _rng_mod.Random(rng_seed)
     batch_best_clique = current_best_clique
     batch_best_sum = current_best_sum
     batch_best_coloring = None
     for _ in range(batch_size):
-        colors = greedy_color_random(adj, n_vertices, rng)
+        colors = greedy_color_random(adj, n_vertices, rng,
+                                     max_colors=batch_best_clique)
+        if colors is None:
+            continue  # aborted early; this ordering cannot improve K
         n_colors = max(colors) + 1 if colors else 0
+        # n_colors <= batch_best_clique is guaranteed by max_colors gating,
+        # but keep the check for safety against off-by-one.
         if n_colors <= batch_best_clique:
             color_arr = np.full(n_patterns, -1, dtype=np.int32)
             for i, name in enumerate(names):
@@ -373,22 +480,46 @@ def run_coloring(G_cooccur, pattern_to_idx, p1_idx, p2_idx, w_arr, n_patterns, l
         return None, 0, 0
     if n == 1:
         return {names[0]: 0}, 1, 0
+
+    # --- DSATUR seed: deterministic single-pass coloring that establishes
+    # a strong upper bound on K. The subsequent random search uses this as
+    # the early-abort threshold, so most random orderings die after a few
+    # vertices on large graphs instead of running to completion. ---
+    dsatur_colors_ig = G_cooccur.vertex_coloring_greedy(method='dsatur')
+    dsatur_colors = list(dsatur_colors_ig)
+    best_clique = max(dsatur_colors) + 1
+    color_arr = np.full(n_patterns, -1, dtype=np.int32)
+    for i, name in enumerate(names):
+        if name in pattern_to_idx:
+            color_arr[pattern_to_idx[name]] = dsatur_colors[i]
+    c1 = color_arr[p1_idx]
+    c2 = color_arr[p2_idx]
+    mask = (c1 == c2) & (c1 >= 0)
+    best_sum = float(w_arr[mask].sum())
+    best_coloring = {name: dsatur_colors[i] for i, name in enumerate(names)}
+    print(f"  DSATUR seed: colors={best_clique}, weight={best_sum}")
+
     total_iterations = n * 2500
     batch_size = 1000
-    best_clique = n + 1
-    best_sum = 0
-    best_coloring = None
-    patience = max(50000, n * 500)
+    patience = max(50000, n * 50)
     iters_since_improvement = 0
     total_processed = 0
+    batch_idx = 0
     # Pre-extract adjacency list for fast coloring in the hot loop
     adj = [G_cooccur.neighbors(v) for v in range(n)]
     while total_processed < total_iterations:
         iters_this_round = min(batch_size, total_iterations - total_processed)
+        # Deterministic per-batch seed derived from the global RANDOM_SEED, the
+        # number of vertices, and the batch index, so the random-ordering search
+        # is fully reproducible across runs (fixes the prior random.Random()
+        # that pulled from system entropy).
+        batch_seed = (RANDOM_SEED * 1_000_003 + n * 9973 + batch_idx) & 0x7FFFFFFF
         batch_clique, batch_sum, batch_coloring = _coloring_batch(
             adj, n, names, pattern_to_idx, p1_idx, p2_idx, w_arr,
-            n_patterns, iters_this_round, best_clique, best_sum
+            n_patterns, iters_this_round, best_clique, best_sum,
+            rng_seed=batch_seed
         )
+        batch_idx += 1
         total_processed += iters_this_round
         improved = False
         if batch_coloring is not None:
@@ -434,6 +565,26 @@ def _build_locus_and_umi(cell_index, binary_arr, all_patterns_arr,
     cell_indices = cell_indices[valid]
     pattern_indices = pattern_indices[valid]
     colors = colors[valid]
+
+    # Collision check: a (cell, color) slot written by more than one pattern
+    # means two patterns at the SAME inferred locus in the SAME cell — a
+    # biological contradiction (a locus carries one edit state per cell).
+    # numpy fancy-index assignment keeps only the last write, silently dropping
+    # the others. This can happen when a pattern pair co-occurs in exactly one
+    # cell (the cell-level augmentation requires >=2 cells to add the edge that
+    # would force different colors). Warn so the user knows it occurred.
+    flat_slots = cell_indices.astype(np.int64) * n_colors + colors.astype(np.int64)
+    n_collisions = len(flat_slots) - len(np.unique(flat_slots))
+    if n_collisions > 0:
+        n_cells_affected = len(np.unique(
+            flat_slots[pd.Series(flat_slots).duplicated(keep=False).values]
+            // n_colors
+        )) if len(flat_slots) else 0
+        print(f"  Warning: {n_collisions} pattern-collision overwrite(s) in "
+              f"locus assignment across {n_cells_affected} cell(s) — two patterns "
+              f"assigned the same locus in the same cell (last-written kept). "
+              f"Possible doublet, residual noise, or a once-co-occurring pair.")
+
     locus_arr[cell_indices, colors] = all_patterns_arr[pattern_indices]
     if nUMI_adjusted is not None:
         nUMI_vals = nUMI_adjusted.values
@@ -473,8 +624,8 @@ def gen_patterns(df_filter, tapebc="", min_umi=2, plot=False, outdir="", name=""
     if len(test_real) == 0:
         print("  No real sequences found")
         locus_df = pd.DataFrame(
-            index=np.unique(cells), columns=[tapebc + "-0"]
-        ).fillna("")
+            "", index=np.unique(cells), columns=[tapebc + "-0"]
+        )
         umi_df = pd.DataFrame(
             0.0, index=np.unique(cells), columns=[tapebc + "-0"]
         )
@@ -487,8 +638,8 @@ def gen_patterns(df_filter, tapebc="", min_umi=2, plot=False, outdir="", name=""
     if len(test_real) == 0:
         print("  No sequences above UMI cutoff after redistribution")
         locus_df = pd.DataFrame(
-            index=np.unique(cells), columns=[tapebc + "-0"]
-        ).fillna("")
+            "", index=np.unique(cells), columns=[tapebc + "-0"]
+        )
         umi_df = pd.DataFrame(
             0.0, index=np.unique(cells), columns=[tapebc + "-0"]
         )
@@ -500,16 +651,16 @@ def gen_patterns(df_filter, tapebc="", min_umi=2, plot=False, outdir="", name=""
 
     if len(unique_patterns) == 0:
         locus_df = pd.DataFrame(
-            index=np.unique(cells), columns=[tapebc + "-0"]
-        ).fillna("")
+            "", index=np.unique(cells), columns=[tapebc + "-0"]
+        )
         umi_df = pd.DataFrame(
             0.0, index=np.unique(cells), columns=[tapebc + "-0"]
         )
         return ("early", locus_df, umi_df)
 
     print(f"  Unique patterns (including ETY): {len(unique_patterns)}")
-    for p in unique_patterns:
-        print(f"    {p}: {pattern_counts[p]} UMIs")
+    # for p in unique_patterns:
+    #     print(f"    {p}: {pattern_counts[p]} UMIs")
 
     print("Counting nUMI per cell per pattern...")
     entries = test_real[test_real['Pattern'].isin(unique_patterns)]
@@ -522,7 +673,7 @@ def gen_patterns(df_filter, tapebc="", min_umi=2, plot=False, outdir="", name=""
     if len(non_ety_patterns) == 0:
         all_cells = np.unique(cells)
         col_name = tapebc + "-0"
-        locus_df = pd.DataFrame(index=all_cells, columns=[col_name]).fillna("ETY")
+        locus_df = pd.DataFrame("ETY", index=all_cells, columns=[col_name])
         umi_df = pd.DataFrame(0.0, index=all_cells, columns=[col_name])
         if "ETY" in nUMI.columns:
             for cell in all_cells:
@@ -533,7 +684,7 @@ def gen_patterns(df_filter, tapebc="", min_umi=2, plot=False, outdir="", name=""
     if len(non_ety_patterns) == 1:
         all_cells = np.unique(cells)
         col_name = tapebc + "-0"
-        locus_df = pd.DataFrame(index=all_cells, columns=[col_name]).fillna("")
+        locus_df = pd.DataFrame("", index=all_cells, columns=[col_name])
         umi_df = pd.DataFrame(0.0, index=all_cells, columns=[col_name])
         p = non_ety_patterns[0]
         for cell in locus_df.index:
@@ -603,6 +754,21 @@ def gen_patterns(df_filter, tapebc="", min_umi=2, plot=False, outdir="", name=""
 
     binary = np.where(log_umi > threshold_pass2, 1.0, 0.0)
 
+    # Drop pattern columns that are above threshold in zero cells. These
+    # patterns can never be assigned to a locus (they're never 'present' in
+    # any cell), so they'd only show up as isolated vertices in the full
+    # graph and as wasted pairwise-weight computations. Removing them keeps
+    # nUMI_adjusted intact (used for ETY filling) but cleans up the matrices
+    # passed to find_graph_and_partition.
+    col_sums_binary = binary.sum(axis=0)
+    keep_cols = col_sums_binary > 0
+    n_dropped = int((~keep_cols).sum())
+    if n_dropped > 0:
+        print(f"  Dropped {n_dropped} pattern(s) with no cells above threshold "
+              f"({int(keep_cols.sum())} kept)")
+        binary = binary[:, keep_cols]
+        log_umi = log_umi.loc[:, keep_cols]
+
     # has_ety covers ALL cells in the original nUMI (including ETY-only ones
     # that were dropped from nUMI_for_binary), so we can re-insert them later
     has_ety = None
@@ -623,7 +789,7 @@ def gen_patterns(df_filter, tapebc="", min_umi=2, plot=False, outdir="", name=""
 
 def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
                              min_cells=5, plot=False,
-                             outdir="", name="", impute=False):
+                             outdir="", name=""):
     binary = pd.DataFrame(index=log_umi.index, columns=log_umi.columns, data=binary)
     all_patterns = list(binary.columns)
     all_patterns_arr = np.array(all_patterns)
@@ -656,18 +822,31 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
 
         binary_for_clustering = binary_core.loc[nonzero_rows].copy()
 
-        dist = pairwise_distances(binary_for_clustering, metric='hamming')
-        dist = dist * binary_for_clustering.shape[1]
-        dist = dist.astype(int)
-        clustering = DBSCAN(
-            eps=0.5, min_samples=min_cells, metric='precomputed', n_jobs=1
-        ).fit_predict(dist)
+        # Group identical binary vectors. With the original DBSCAN settings
+        # (eps=0.5, integer Hamming distance, min_samples=min_cells), the only
+        # cells that ever clustered together were ones with exactly identical
+        # binary vectors, and groups of size < min_cells were labeled noise.
+        # This groupby reproduces those semantics exactly in O(N*D) time and
+        # O(N*D) memory, vs DBSCAN's O(N^2) on both axes.
+        binary_arr_clust = binary_for_clustering.values.astype(np.uint8)
+        cell_index_clust = binary_for_clustering.index
+        group_map = defaultdict(list)
+        for cell_pos, row in enumerate(binary_arr_clust):
+            group_map[row.tobytes()].append(cell_pos)
 
-        assign = pd.Series(clustering, index=binary_for_clustering.index).astype(str)
+        labels = np.full(len(binary_arr_clust), -1, dtype=np.int64)
+        next_label = 0
+        for indices in group_map.values():
+            if len(indices) >= min_cells:
+                for i in indices:
+                    labels[i] = next_label
+                next_label += 1
+
+        assign = pd.Series(labels, index=cell_index_clust).astype(str)
         cluster_unique = [c for c in np.unique(assign.values) if c != '-1']
-        n_noise = (assign == '-1').sum()
-        print(f"  Number of DBSCAN clusters: {len(cluster_unique)}")
-        print(f"  DBSCAN noise cells: {n_noise}")
+        n_noise = int((assign == '-1').sum())
+        print(f"  Number of clusters (identical-vector groups): {len(cluster_unique)}")
+        print(f"  Noise cells (vector seen in < min_cells cells): {n_noise}")
 
         cluster_sig = {}
         for i in cluster_unique:
@@ -707,7 +886,7 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
 
         if core_coloring is None:
             print("  Core coloring failed, returning single locus")
-            locus_df = pd.DataFrame(index=binary.index, columns=["0"]).fillna("")
+            locus_df = pd.DataFrame("", index=binary.index, columns=["0"])
             umi_df = pd.DataFrame(0.0, index=binary.index, columns=["0"])
             return locus_df, None, umi_df
 
@@ -731,7 +910,12 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
         G_cooccur_full = G_cooccur_core.copy()
         G_cooccur_full.add_vertices(peripheral_patterns)
 
+        # Collect peripheral-incident co-occurrence edges in a set first so we
+        # don't add duplicate edges to the graph (which would inflate ecount()
+        # and the logged edge count). Edges already in the core graph are
+        # skipped via get_eid.
         peripheral_set = set(peripheral_patterns)
+        new_edges = set()
         for i in range(len(binary.index)):
             present = all_patterns_arr[binary_arr[i]]
             if len(present) < 2:
@@ -741,7 +925,13 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
                 continue
             for a, b in combinations(present, 2):
                 if a in peripheral_set or b in peripheral_set:
-                    G_cooccur_full.add_edge(a, b)
+                    new_edges.add((a, b) if a < b else (b, a))
+        edges_to_add = [
+            (a, b) for (a, b) in new_edges
+            if G_cooccur_full.get_eid(a, b, error=False) == -1
+        ]
+        if edges_to_add:
+            G_cooccur_full.add_edges(edges_to_add)
 
         print(f"  Full co-occurrence graph: {G_cooccur_full.vcount()} nodes, "
               f"{G_cooccur_full.ecount()} edges")
@@ -819,7 +1009,7 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
         )
         if full_coloring is None:
             print("  Coloring failed, returning single locus")
-            locus_df = pd.DataFrame(index=binary.index, columns=["0"]).fillna("")
+            locus_df = pd.DataFrame("", index=binary.index, columns=["0"])
             umi_df = pd.DataFrame(0.0, index=binary.index, columns=["0"])
             return locus_df, None, umi_df
         final_coloring = full_coloring
@@ -844,7 +1034,7 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
 
 
 def analyze_tape(df_filter, tapebc="", min_umi=2, min_cells=5, plot=False,
-                 outdir="", name="", impute=False):
+                 outdir="", name=""):
     time1 = timeit.default_timer()
     run_dir = os.path.join(outdir, name)
     log_dir = os.path.join(run_dir, "stdout")
@@ -865,7 +1055,7 @@ def analyze_tape(df_filter, tapebc="", min_umi=2, min_cells=5, plot=False,
                         binary, log_umi,
                         nUMI_adjusted=nUMI_adjusted,
                         min_cells=min_cells, plot=plot,
-                        outdir=outdir, name=name, impute=impute
+                        outdir=outdir, name=name
                     )
 
                     locus_df = partition_results[0]
@@ -897,7 +1087,7 @@ def analyze_tape(df_filter, tapebc="", min_umi=2, min_cells=5, plot=False,
                     # Fill unassigned loci with ETY + evenly distributed ETY UMI
                     if has_ety is not None:
                         for cell in locus_df.index:
-                            if cell in has_ety.index and has_ety.get(cell, False):
+                            if cell in has_ety.index and bool(has_ety.loc[cell]):
                                 empty_cols = [ci for ci, col in enumerate(locus_df.columns)
                                               if locus_df.loc[cell, col] == ""]
                                 n_empty = len(empty_cols)
@@ -931,11 +1121,15 @@ def analyze_tape(df_filter, tapebc="", min_umi=2, min_cells=5, plot=False,
 
 
 def main(csv_path="", umi_cutoff=2, min_umi=2, min_cells=5, plot=False,
-         outdir=".", name="", impute=False, edit_key="GGAT", use_rpu=False,
-         num_sites=6):
-    global EDIT_KEY, EDIT_KEY_LEN
+         outdir=".", name="", edit_key="GGAT", use_rpu=False,
+         num_sites=6, seed=RANDOM_SEED):
+    global EDIT_KEY, EDIT_KEY_LEN, RANDOM_SEED
     EDIT_KEY = edit_key
     EDIT_KEY_LEN = len(EDIT_KEY)
+    # Reset all RNGs at run start so results are reproducible regardless of
+    # import timing or repeated main() calls in one process.
+    RANDOM_SEED = seed
+    set_seeds(seed)
 
     run_dir = os.path.join(outdir, name)
     log_dir = os.path.join(run_dir, "stdout")
@@ -994,7 +1188,7 @@ def main(csv_path="", umi_cutoff=2, min_umi=2, min_cells=5, plot=False,
         delayed(analyze_tape)(
             df_filter, i, min_umi=min_umi,
             min_cells=min_cells, plot=plot,
-            outdir=outdir, name=name, impute=impute
+            outdir=outdir, name=name
         )
         for i in tape_list
     )
@@ -1052,6 +1246,8 @@ if __name__ == "__main__":
                         required=False, default=2, type=int)
     parser.add_argument('-mc', '--min_cells', help="Minimum cells for core patterns",
                         required=False, default=5, type=int)
+    parser.add_argument('-imp', '--impute', help="For backwards compatibility",
+                        required=False, default=False, type=bool)
     parser.add_argument('-o', '--output_csv', help="Output csv filename", required=True)
     parser.add_argument('-d', '--outdir', help="Output directory (default: current directory)",
                         required=False, default=".")
@@ -1061,12 +1257,10 @@ if __name__ == "__main__":
                         required=True)
     parser.add_argument('--use_rpu', help="Use reads-per-UMI filtering (default: False)",
                         required=False, default="False")
-    parser.add_argument('--impute', help="Impute orphan cells via KNN (boolean)",
-                        required=False, default="False")
     parser.add_argument('-ns', '--num_sites', help="Number of sites per tape",
                         required=False, default=6, type=int)
     parser.add_argument('-ek', '--edit_key', help="Edit key suffix to strip from sites (default: GGAT)",
-                        required=True, default="GGAT")
+                        required=False, default="GGAT")
     # EXPRESSION OUTPUT: new CLI argument
     parser.add_argument('-e', '--expression_csv',
                         help="Output expression (adjusted UMI) CSV filename",
@@ -1092,11 +1286,6 @@ if __name__ == "__main__":
     else:
         use_rpu = False
 
-    if str(argument.impute).lower() == "true":
-        impute = True
-    else:
-        impute = False
-
     EDIT_KEY = str(argument.edit_key)
     EDIT_KEY_LEN = len(EDIT_KEY)
     print(f"Edit key: {EDIT_KEY} (length {EDIT_KEY_LEN})")
@@ -1109,7 +1298,7 @@ if __name__ == "__main__":
         csv_path=csv_path, umi_cutoff=umi_cutoff,
         min_umi=min_umi, min_cells=min_cells,
         plot=plot, outdir=outdir,
-        name=name, impute=impute, edit_key=EDIT_KEY,
+        name=name, edit_key=EDIT_KEY,
         use_rpu=use_rpu, num_sites=int(argument.num_sites)
     )
 
