@@ -11,7 +11,7 @@ from sklearn.cluster import DBSCAN
 import seaborn as sns
 from sklearn.neighbors import KernelDensity, BallTree
 from scipy.signal import find_peaks
-import networkx as nx
+import igraph as ig
 import os
 import contextlib
 import traceback
@@ -285,13 +285,17 @@ def evaluate_coloring_weight(coloring_dict, pattern_to_idx, p1_idx, p2_idx, w_ar
 # =========================================================================
 
 def build_cooccurrence_graph_from_clusters(patterns, cluster_sig, binary_columns):
-    G = nx.Graph()
-    G.add_nodes_from(patterns)
+    G = ig.Graph(directed=False)
+    G.add_vertices(patterns)
+    name_set = set(patterns)
+    edges = set()
     for i in cluster_sig:
         present = [col for col, val in zip(binary_columns, cluster_sig[i]) if val > 0.5]
-        present_in_graph = [p for p in present if p in patterns]
+        present_in_graph = [p for p in present if p in name_set]
         for a, b in combinations(present_in_graph, 2):
-            G.add_edge(a, b)
+            edges.add((a, b))
+    if edges:
+        G.add_edges(list(edges))
     return G
 
 
@@ -299,21 +303,56 @@ def build_cooccurrence_graph_from_clusters(patterns, cluster_sig, binary_columns
 # Graph coloring
 # =========================================================================
 
-def _coloring_batch(G_cooccur_adj, nodes, pattern_to_idx, p1_idx, p2_idx, w_arr,
+def greedy_color_random(adj, n, rng):
+    """Greedy graph coloring with random vertex ordering.
+    
+    Equivalent to nx.greedy_color(G, strategy='random_sequential') but operates
+    on a pre-extracted adjacency list (list of lists of neighbor indices) for
+    maximum performance in tight loops.
+    
+    Args:
+        adj: list of lists — adj[v] = list of neighbor vertex indices
+        n: number of vertices
+        rng: random.Random instance for shuffling
+    
+    Returns a list of color assignments indexed by vertex ID.
+    """
+    order = list(range(n))
+    rng.shuffle(order)
+    colors = [-1] * n
+    used = [False] * n  # boolean array; n is upper bound on colors
+    for v in order:
+        nbs = adj[v]
+        for nb in nbs:
+            c = colors[nb]
+            if c >= 0:
+                used[c] = True
+        c = 0
+        while used[c]:
+            c += 1
+        colors[v] = c
+        for nb in nbs:
+            c = colors[nb]
+            if c >= 0:
+                used[c] = False
+    return colors
+
+
+def _coloring_batch(adj, n_vertices, names, pattern_to_idx, p1_idx, p2_idx, w_arr,
                     n_patterns, batch_size, current_best_clique, current_best_sum):
-    import networkx as nx
-    G_cooccur = nx.from_dict_of_dicts(G_cooccur_adj)
+    import random as _rng_mod
+    rng = _rng_mod.Random()
     batch_best_clique = current_best_clique
     batch_best_sum = current_best_sum
     batch_best_coloring = None
     for _ in range(batch_size):
-        coloring = nx.greedy_color(G_cooccur, strategy='random_sequential', interchange=False)
-        n_colors = max(coloring.values()) + 1 if coloring else 0
+        colors = greedy_color_random(adj, n_vertices, rng)
+        n_colors = max(colors) + 1 if colors else 0
         if n_colors <= batch_best_clique:
             color_arr = np.full(n_patterns, -1, dtype=np.int32)
-            for node_str, c in coloring.items():
-                if node_str in pattern_to_idx:
-                    color_arr[pattern_to_idx[node_str]] = c
+            for i, name in enumerate(names):
+                if name in pattern_to_idx:
+                    color_arr[pattern_to_idx[name]] = colors[i]
             c1 = color_arr[p1_idx]
             c2 = color_arr[p2_idx]
             mask = (c1 == c2) & (c1 >= 0)
@@ -321,18 +360,19 @@ def _coloring_batch(G_cooccur_adj, nodes, pattern_to_idx, p1_idx, p2_idx, w_arr,
             if n_colors < batch_best_clique or weight > batch_best_sum:
                 batch_best_clique = n_colors
                 batch_best_sum = weight
-                batch_best_coloring = dict(coloring)
+                batch_best_coloring = {name: colors[i] for i, name in enumerate(names)}
     return batch_best_clique, batch_best_sum, batch_best_coloring
+
 
 
 def run_coloring(G_cooccur, pattern_to_idx, p1_idx, p2_idx, w_arr, n_patterns, label=""):
     print(f"Finding best graph partition ({label})...")
-    nodes = list(G_cooccur.nodes())
-    n = len(nodes)
+    names = G_cooccur.vs['name']
+    n = len(names)
     if n == 0:
         return None, 0, 0
     if n == 1:
-        return {nodes[0]: 0}, 1, 0
+        return {names[0]: 0}, 1, 0
     total_iterations = n * 2500
     batch_size = 1000
     best_clique = n + 1
@@ -341,11 +381,12 @@ def run_coloring(G_cooccur, pattern_to_idx, p1_idx, p2_idx, w_arr, n_patterns, l
     patience = max(50000, n * 500)
     iters_since_improvement = 0
     total_processed = 0
-    G_cooccur_adj = nx.to_dict_of_dicts(G_cooccur)
+    # Pre-extract adjacency list for fast coloring in the hot loop
+    adj = [G_cooccur.neighbors(v) for v in range(n)]
     while total_processed < total_iterations:
         iters_this_round = min(batch_size, total_iterations - total_processed)
         batch_clique, batch_sum, batch_coloring = _coloring_batch(
-            G_cooccur_adj, nodes, pattern_to_idx, p1_idx, p2_idx, w_arr,
+            adj, n, names, pattern_to_idx, p1_idx, p2_idx, w_arr,
             n_patterns, iters_this_round, best_clique, best_sum
         )
         total_processed += iters_this_round
@@ -374,6 +415,7 @@ def run_coloring(G_cooccur, pattern_to_idx, p1_idx, p2_idx, w_arr, n_patterns, l
 # =========================================================================
 # EXPRESSION OUTPUT HELPER: build locus + UMI matrices from a coloring
 # =========================================================================
+
 
 def _build_locus_and_umi(cell_index, binary_arr, all_patterns_arr,
                          coloring, n_colors, nUMI_adjusted):
@@ -561,16 +603,20 @@ def gen_patterns(df_filter, tapebc="", min_umi=2, plot=False, outdir="", name=""
 
     binary = np.where(log_umi > threshold_pass2, 1.0, 0.0)
 
+    # has_ety covers ALL cells in the original nUMI (including ETY-only ones
+    # that were dropped from nUMI_for_binary), so we can re-insert them later
     has_ety = None
     if "ETY" in nUMI.columns:
         has_ety = nUMI["ETY"] > 0
 
     # EXPRESSION OUTPUT: build adjusted UMI matrix
     # nUMI_for_binary now has shadow-redistributed values for non-ETY patterns
-    # Combine with ETY from original nUMI
-    nUMI_adjusted = nUMI_for_binary.copy()
+    # Combine with ETY from original nUMI. Index over ALL cells (not just
+    # nUMI_for_binary.index) so ETY-only cells dropped from binarization are
+    # still represented in nUMI_adjusted for downstream ETY filling.
+    nUMI_adjusted = nUMI_for_binary.reindex(nUMI.index, fill_value=0)
     if "ETY" in nUMI.columns:
-        nUMI_adjusted["ETY"] = nUMI.loc[nUMI_for_binary.index, "ETY"].values
+        nUMI_adjusted["ETY"] = nUMI["ETY"].values
 
     return ("normal", binary, log_umi, has_ety, nUMI_adjusted)
 
@@ -614,7 +660,7 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
         dist = dist * binary_for_clustering.shape[1]
         dist = dist.astype(int)
         clustering = DBSCAN(
-            eps=0.5, min_samples=min_cells, metric='precomputed', n_jobs=-1
+            eps=0.5, min_samples=min_cells, metric='precomputed', n_jobs=1
         ).fit_predict(dist)
 
         assign = pd.Series(clustering, index=binary_for_clustering.index).astype(str)
@@ -633,9 +679,9 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
         G_cooccur_core = build_cooccurrence_graph_from_clusters(
             core_patterns, cluster_sig, binary_for_clustering.columns
         )
-        n_cluster_edges = len(G_cooccur_core.edges())
+        n_cluster_edges = G_cooccur_core.ecount()
         print(f"  Core co-occurrence graph (from clusters): "
-              f"{len(G_cooccur_core.nodes())} nodes, {n_cluster_edges} edges")
+              f"{G_cooccur_core.vcount()} nodes, {n_cluster_edges} edges")
         cell_edge_counts = Counter()
         for i in range(len(binary_for_clustering.index)):
             present = [p for p, val in zip(core_patterns, binary_for_clustering.values[i]) if val > 0.5]
@@ -644,12 +690,12 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
                     cell_edge_counts[(min(a, b), max(a, b))] += 1
         n_augmented = 0
         for (a, b), count in cell_edge_counts.items():
-            if count >= 2 and not G_cooccur_core.has_edge(a, b):
+            if count >= 2 and G_cooccur_core.get_eid(a, b, error=False) == -1:
                 G_cooccur_core.add_edge(a, b)
                 n_augmented += 1
         if n_augmented > 0:
             print(f"  Augmented core graph with {n_augmented} cell-level co-occurrence edges (>=2 cells)")
-        print(f"  Final core co-occurrence graph: {len(G_cooccur_core.nodes())} nodes, {len(G_cooccur_core.edges())} edges")
+        print(f"  Final core co-occurrence graph: {G_cooccur_core.vcount()} nodes, {G_cooccur_core.ecount()} edges")
 
         core_pattern_to_idx, core_p1, core_p2, core_w = precompute_pair_weights(core_patterns)
         n_core = len(core_patterns)
@@ -683,7 +729,7 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
         print("Building full co-occurrence graph...")
 
         G_cooccur_full = G_cooccur_core.copy()
-        G_cooccur_full.add_nodes_from(peripheral_patterns)
+        G_cooccur_full.add_vertices(peripheral_patterns)
 
         peripheral_set = set(peripheral_patterns)
         for i in range(len(binary.index)):
@@ -697,8 +743,8 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
                 if a in peripheral_set or b in peripheral_set:
                     G_cooccur_full.add_edge(a, b)
 
-        print(f"  Full co-occurrence graph: {len(G_cooccur_full.nodes())} nodes, "
-              f"{len(G_cooccur_full.edges())} edges")
+        print(f"  Full co-occurrence graph: {G_cooccur_full.vcount()} nodes, "
+              f"{G_cooccur_full.ecount()} edges")
 
         full_coloring, full_n_colors, full_weight = run_coloring(
             G_cooccur_full, pattern_to_idx, p1_idx, p2_idx, w_arr,
@@ -753,19 +799,20 @@ def find_graph_and_partition(binary, log_umi, nUMI_adjusted=None,
                 edge_key = (min(a, b), max(a, b))
                 edge_counts[edge_key] += 1
         for min_cooccur in [2, 1]:
-            G_cooccur_all = nx.Graph()
-            G_cooccur_all.add_nodes_from(all_patterns)
-            for (a, b), count in edge_counts.items():
-                if count >= min_cooccur:
-                    G_cooccur_all.add_edge(a, b)
-            if len(G_cooccur_all.edges()) > 0:
+            G_cooccur_all = ig.Graph(directed=False)
+            G_cooccur_all.add_vertices(all_patterns)
+            edges_to_add = [(a, b) for (a, b), count in edge_counts.items()
+                            if count >= min_cooccur]
+            if edges_to_add:
+                G_cooccur_all.add_edges(edges_to_add)
+            if G_cooccur_all.ecount() > 0:
                 print(f"  Using min_cooccur={min_cooccur}: "
-                      f"{len(G_cooccur_all.edges())} edges")
+                      f"{G_cooccur_all.ecount()} edges")
                 break
             else:
                 print(f"  min_cooccur={min_cooccur} gives 0 edges, trying lower...")
-        print(f"  Co-occurrence graph: {len(G_cooccur_all.nodes())} nodes, "
-              f"{len(G_cooccur_all.edges())} edges")
+        print(f"  Co-occurrence graph: {G_cooccur_all.vcount()} nodes, "
+              f"{G_cooccur_all.ecount()} edges")
         full_coloring, full_n_colors, full_weight = run_coloring(
             G_cooccur_all, pattern_to_idx, p1_idx, p2_idx, w_arr,
             n_patterns, label="full (no core)"
@@ -832,6 +879,21 @@ def analyze_tape(df_filter, tapebc="", min_umi=2, min_cells=5, plot=False,
                         tapebc + "-" + str(i) for i in umi_df.columns
                     ]
 
+                    # Re-insert ETY-only cells that were dropped from binarization.
+                    # These cells had this TapeBC but only as unedited (ETY) — they
+                    # belong in the output as ETY at every locus.
+                    if has_ety is not None:
+                        missing_cells = has_ety.index.difference(locus_df.index)
+                        if len(missing_cells) > 0:
+                            empty_locus = pd.DataFrame(
+                                "", index=missing_cells, columns=locus_df.columns
+                            )
+                            empty_umi = pd.DataFrame(
+                                0.0, index=missing_cells, columns=umi_df.columns
+                            )
+                            locus_df = pd.concat([locus_df, empty_locus])
+                            umi_df = pd.concat([umi_df, empty_umi])
+
                     # Fill unassigned loci with ETY + evenly distributed ETY UMI
                     if has_ety is not None:
                         for cell in locus_df.index:
@@ -869,7 +931,8 @@ def analyze_tape(df_filter, tapebc="", min_umi=2, min_cells=5, plot=False,
 
 
 def main(csv_path="", umi_cutoff=2, min_umi=2, min_cells=5, plot=False,
-         outdir=".", name="", impute=False, edit_key="GGAT", use_rpu=False):
+         outdir=".", name="", impute=False, edit_key="GGAT", use_rpu=False,
+         num_sites=6):
     global EDIT_KEY, EDIT_KEY_LEN
     EDIT_KEY = edit_key
     EDIT_KEY_LEN = len(EDIT_KEY)
@@ -886,34 +949,38 @@ def main(csv_path="", umi_cutoff=2, min_umi=2, min_cells=5, plot=False,
         lambda row: parse_sites(row, site_cols), axis=1
     )
 
-    print("Computing reads/UMI threshold...")
-    log_rpu = np.log(df_filter['nRead'].values / df_filter['nUMI'].values + 0.01)
-    log_rpu_df = pd.DataFrame(log_rpu, columns=['log_rpu'])
-    rpu_threshold, kde_x, kde_smooth = compute_kde_threshold(log_rpu_df, log=False)
+    if use_rpu:
+        print("Computing reads/UMI threshold...")
+        log_rpu = np.log(df_filter['nRead'].values / df_filter['nUMI'].values + 0.01)
+        log_rpu_df = pd.DataFrame(log_rpu, columns=['log_rpu'])
+        rpu_threshold, kde_x, kde_smooth = compute_kde_threshold(log_rpu_df, log=False)
 
-    rpu_natural = np.exp(rpu_threshold)
-    rpu_natural = np.clip(rpu_natural, RPU_FLOOR, RPU_CEILING)
-    rpu_threshold = np.log(rpu_natural)
+        rpu_natural = np.exp(rpu_threshold)
+        rpu_natural = np.clip(rpu_natural, RPU_FLOOR, RPU_CEILING)
+        rpu_threshold = np.log(rpu_natural)
 
-    print(f"  Reads/UMI threshold (log scale): {rpu_threshold:.3f}")
-    print(f"  Reads/UMI threshold (natural scale): {rpu_natural:.2f}")
-    print(f"  i.e., requiring >= ~{rpu_natural:.1f} reads per UMI")
+        print(f"  Reads/UMI threshold (log scale): {rpu_threshold:.3f}")
+        print(f"  Reads/UMI threshold (natural scale): {rpu_natural:.2f}")
+        print(f"  i.e., requiring >= ~{rpu_natural:.1f} reads per UMI")
 
-    if plot:
-        plt.hist(log_rpu, density=True, bins=50, alpha=0.7)
-        plt.plot(kde_x, kde_smooth, color='red')
-        plt.axvline(rpu_threshold, color='blue', linestyle='--',
-                    label=f'threshold={rpu_threshold:.2f}')
-        plt.title('Reads per UMI distribution')
-        plt.ylabel("Density")
-        plt.xlabel("Log(reads/UMI)")
-        plt.legend()
-        plt.savefig(os.path.join(log_dir, "reads_per_umi.svg"), dpi=300)
-        plt.show()
-        plt.clf()
+        if plot:
+            plt.hist(log_rpu, density=True, bins=50, alpha=0.7)
+            plt.plot(kde_x, kde_smooth, color='red')
+            plt.axvline(rpu_threshold, color='blue', linestyle='--',
+                        label=f'threshold={rpu_threshold:.2f}')
+            plt.title('Reads per UMI distribution')
+            plt.ylabel("Density")
+            plt.xlabel("Log(reads/UMI)")
+            plt.legend()
+            plt.savefig(os.path.join(log_dir, "reads_per_umi.svg"), dpi=300)
+            plt.show()
+            plt.clf()
 
-    log_rpu_values = np.log(df_filter['nRead'].values / df_filter['nUMI'].values + 0.01)
-    df_filter['is_real'] = (log_rpu_values >= rpu_threshold) & (df_filter['nUMI'] >= umi_cutoff)
+        log_rpu_values = np.log(df_filter['nRead'].values / df_filter['nUMI'].values + 0.01)
+        df_filter['is_real'] = (log_rpu_values >= rpu_threshold) & (df_filter['nUMI'] >= umi_cutoff)
+    else:
+        print("RPU filtering disabled, using UMI cutoff only...")
+        df_filter['is_real'] = df_filter['nUMI'] >= umi_cutoff
 
     n_real = df_filter['is_real'].sum()
     n_noise = (~df_filter['is_real']).sum()
@@ -922,7 +989,7 @@ def main(csv_path="", umi_cutoff=2, min_umi=2, min_cells=5, plot=False,
     tape_list = np.unique(df_filter['TargetBC'].values)
     print(f"Processing {len(tape_list)} TapeBCs in parallel...")
 
-    actual_n_jobs = cpu_count()
+    actual_n_jobs = int(os.environ.get('NSLOTS', os.environ.get('SLURM_CPUS_PER_TASK', 1)))
     results_list = Parallel(n_jobs=actual_n_jobs, prefer="processes")(
         delayed(analyze_tape)(
             df_filter, i, min_umi=min_umi,
@@ -956,12 +1023,7 @@ def main(csv_path="", umi_cutoff=2, min_umi=2, min_cells=5, plot=False,
     expr_df = expr_df.reindex(index=full_df.index, fill_value=0.0)
 
     # Decompose patterns into per-site columns (vectorized)
-    max_sites = full_df.apply(
-        lambda col: col[~col.isin(["", "ETY"])].apply(
-            lambda v: len(v.split(WORD_DELIMITER))
-        ).max()
-    ).max()
-    max_sites = int(max_sites) if not pd.isna(max_sites) else 6
+    max_sites = num_sites
 
     site_df = pd.DataFrame(index=full_df.index)
     for j in full_df.columns:
@@ -997,8 +1059,12 @@ if __name__ == "__main__":
                         required=False, default="False")
     parser.add_argument('-n', '--folder_name', help="Name for log subfolder",
                         required=True)
+    parser.add_argument('--use_rpu', help="Use reads-per-UMI filtering (default: False)",
+                        required=False, default="False")
     parser.add_argument('--impute', help="Impute orphan cells via KNN (boolean)",
                         required=False, default="False")
+    parser.add_argument('-ns', '--num_sites', help="Number of sites per tape",
+                        required=False, default=6, type=int)
     parser.add_argument('-ek', '--edit_key', help="Edit key suffix to strip from sites (default: GGAT)",
                         required=True, default="GGAT")
     # EXPRESSION OUTPUT: new CLI argument
@@ -1021,6 +1087,11 @@ if __name__ == "__main__":
     else:
         plot = False
 
+    if str(argument.use_rpu).lower() == "true":
+        use_rpu = True
+    else:
+        use_rpu = False
+
     if str(argument.impute).lower() == "true":
         impute = True
     else:
@@ -1038,7 +1109,8 @@ if __name__ == "__main__":
         csv_path=csv_path, umi_cutoff=umi_cutoff,
         min_umi=min_umi, min_cells=min_cells,
         plot=plot, outdir=outdir,
-        name=name, impute=impute
+        name=name, impute=impute, edit_key=EDIT_KEY,
+        use_rpu=use_rpu, num_sites=int(argument.num_sites)
     )
 
     site_df.to_csv(out_path)
